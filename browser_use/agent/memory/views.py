@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, ConfigDict, Field
@@ -8,7 +8,11 @@ class MemoryConfig(BaseModel):
 	"""Configuration for procedural memory."""
 
 	model_config = ConfigDict(
-		from_attributes=True, validate_default=True, revalidate_instances='always', validate_assignment=True
+		from_attributes=True,
+		validate_default=True,
+		revalidate_instances='always',
+		validate_assignment=True,
+		arbitrary_types_allowed=True,  # for BaseChatModel type
 	)
 
 	# Memory settings
@@ -57,6 +61,25 @@ class MemoryConfig(BaseModel):
 	vector_store_config_override: dict[str, Any] | None = Field(
 		default=None,
 		description="Advanced: Override or provide additional config keys that Mem0 expects for the chosen vector_store provider's 'config' dictionary (e.g., host, port, api_key).",
+	)
+
+	enable_graph_memory: bool = Field(
+		default=False,
+		description='Enable graph memory capabilities. If True, graph_store_provider and graph_store_config_override should be appropriately set.',
+	)
+	graph_store_provider: Optional[Literal['neo4j', 'memgraph']] = Field(
+		default=None, description="The graph store provider to use with Mem0 (e.g., 'neo4j', 'memgraph')."
+	)
+	graph_store_config_override: Optional[dict[str, Any]] = Field(
+		default=None,
+		description='Advanced: Provider-specific config for the graph store (e.g., url, username, password). Refer to Mem0 documentation for specific provider requirements.',
+	)
+	graph_store_llm_instance: Optional[BaseChatModel] = Field(
+		default=None,
+		description='Optional: A separate Langchain LLM instance to use specifically for graph operations, overriding the main llm_instance for this purpose.',
+	)
+	graph_store_custom_prompt: Optional[str] = Field(
+		default=None, description='Optional: Custom prompt for entity extraction in the graph store.'
 	)
 
 	@property
@@ -131,10 +154,44 @@ class MemoryConfig(BaseModel):
 		}
 
 	@property
+	def graph_store_config_dict(self) -> Optional[dict[str, Any]]:
+		"""Returns the graph store configuration dictionary for Mem0, if enabled."""
+		if not self.enable_graph_memory or not self.graph_store_provider:
+			return None
+
+		# Base config for the chosen provider
+		graph_config_content: dict[str, Any] = self.graph_store_config_override or {}
+
+		# Construct the structure Mem0 expects for graph_store
+		graph_store_dict: dict[str, Any] = {
+			'provider': self.graph_store_provider,
+			'config': graph_config_content,  # Provider-specific details (url, user, pass etc.)
+		}
+
+		# Add optional LLM for graph store, if provided
+		if self.graph_store_llm_instance:
+			graph_store_dict['llm'] = {  # Mem0 expects llm key under graph_store for specific LLM
+				'provider': 'langchain',  # Assuming we always pass a Langchain LLM
+				'config': {'model': self.graph_store_llm_instance},
+			}
+
+		# Add optional custom prompt for graph store
+		if self.graph_store_custom_prompt:
+			graph_store_dict['custom_prompt'] = self.graph_store_custom_prompt
+
+		return graph_store_dict
+
+	@property
 	def full_config_dict(self) -> dict[str, dict[str, Any]]:
 		"""Returns the complete configuration dictionary for Mem0."""
-		return {
+		config: dict[str, Any] = {
 			'embedder': self.embedder_config_dict,
 			'llm': self.llm_config_dict,
 			'vector_store': self.vector_store_config_dict,
 		}
+
+		graph_config = self.graph_store_config_dict
+		if graph_config:
+			config['graph_store'] = graph_config
+
+		return config
