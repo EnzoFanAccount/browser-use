@@ -652,6 +652,36 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# self.logger.debug('Agent paused after getting state')
 			raise InterruptedError
 
+	def _should_use_vision_for_step(self) -> bool:
+		"""
+		Decide whether to include a screenshot in the prompt for the current step.
+		"""
+		if not self.settings.use_vision:
+			return False
+
+		# if it is the first step, we need vision
+		if not self.state.last_model_output or not self.state.last_model_output.action:
+			return True
+
+		non_visual_actions = {
+			'extract_structured_data',
+			'write_file',
+			'replace_file_str',
+			'read_file',
+			'get_dropdown_options',
+		}
+
+		last_actions = self.state.last_model_output.action
+		for action in last_actions:
+			action_data = action.model_dump(exclude_unset=True)
+			action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+			if action_name not in non_visual_actions:
+				# If any action in the last step was visual, use vision.
+				return True
+		# All actions in the last step were non-visual.
+		self.logger.info('📸 Skipping screenshot for this step as last action was non-visual.')
+		return False
+
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_browser_state_with_recovery')
 	async def _get_browser_state_with_recovery(self, cache_clickable_elements_hashes: bool = True) -> BrowserStateSummary:
 		"""Get browser state with multiple fallback strategies for error recovery"""
@@ -725,13 +755,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			page_action_message = f'For this page, these additional actions are available:\n{page_filtered_actions}'
 			self._message_manager._add_message_with_type(UserMessage(content=page_action_message), 'consistent')
 
+		use_vision_for_this_step = self._should_use_vision_for_step()
+
 		self.logger.debug(f'💬 Step {self.state.n_steps + 1}: Adding state message to context...')
 		self._message_manager.add_state_message(
 			browser_state_summary=browser_state_summary,
 			model_output=self.state.last_model_output,
 			result=self.state.last_result,
 			step_info=step_info,
-			use_vision=self.settings.use_vision,
+			use_vision=use_vision_for_this_step,
 			page_filtered_actions=page_filtered_actions if page_filtered_actions else None,
 			sensitive_data=self.sensitive_data,
 			agent_history_list=self.state.history,  # Pass AgentHistoryList for screenshots
