@@ -130,23 +130,20 @@ class Controller(Generic[Context]):
 			await browser_session.go_back()
 			msg = '🔙  Navigated back'
 			logger.info(msg)
-			return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory='Navigated back')
+			return ActionResult(extracted_content=msg)
 
-		# wait for x seconds
-
-		@self.registry.action('Wait for x seconds default 3 (max 10 seconds)')
+		@self.registry.action(
+			'Wait for x seconds default 3 (max 10 seconds). This can be used to wait until the page is fully loaded.'
+		)
 		async def wait(seconds: int = 3):
 			# Cap wait time at maximum 10 seconds
-			actual_seconds = min(max(seconds, 0), 10)
-			if actual_seconds != seconds:
-				msg = f'🕒  Waiting for {actual_seconds} seconds (capped from {seconds} seconds, max 10 seconds)'
-			else:
-				msg = f'🕒  Waiting for {actual_seconds} seconds'
+			# Reduce the wait time by 3 seconds to account for the llm call which takes at least 3 seconds
+			# So if the model decides to wait for 5 seconds, the llm call took at least 3 seconds, so we only need to wait for 2 seconds
+			actual_seconds = min(max(seconds - 3, 0), 10)
+			msg = f'🕒  Waiting for {actual_seconds + 3} seconds'
 			logger.info(msg)
 			await asyncio.sleep(actual_seconds)
-			return ActionResult(
-				extracted_content=msg, include_in_memory=True, long_term_memory=f'Waited for {actual_seconds} seconds'
-			)
+			return ActionResult(extracted_content=msg)
 
 		# Element Interaction Actions
 
@@ -739,10 +736,10 @@ Explain the content of the page and that the requested information is not availa
 			)
 
 		@self.registry.action(
-			description='Get all options from a native dropdown',
+			description='Get all options from a native dropdown or ARIA menu',
 		)
 		async def get_dropdown_options(index: int, browser_session: BrowserSession) -> ActionResult:
-			"""Get all options from a native dropdown"""
+			"""Get all options from a native dropdown or ARIA menu"""
 			page = await browser_session.get_current_page()
 			dom_element = await browser_session.get_dom_element_by_index(index)
 			if dom_element is None:
@@ -755,30 +752,65 @@ Explain the content of the page and that the requested information is not availa
 
 				for frame in page.frames:
 					try:
+						# First check if it's a native select element
 						options = await frame.evaluate(
 							"""
 							(xpath) => {
-								const select = document.evaluate(xpath, document, null,
+								const element = document.evaluate(xpath, document, null,
 									XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-								if (!select) return null;
+								if (!element) return null;
 
-								return {
-									options: Array.from(select.options).map(opt => ({
-										text: opt.text, //do not trim, because we are doing exact match in select_dropdown_option
-										value: opt.value,
-										index: opt.index
-									})),
-									id: select.id,
-									name: select.name
-								};
+								// Check if it's a native select element
+								if (element.tagName.toLowerCase() === 'select') {
+									return {
+										type: 'select',
+										options: Array.from(element.options).map(opt => ({
+											text: opt.text, //do not trim, because we are doing exact match in select_dropdown_option
+											value: opt.value,
+											index: opt.index
+										})),
+										id: element.id,
+										name: element.name
+									};
+								}
+								
+								// Check if it's an ARIA menu
+								if (element.getAttribute('role') === 'menu' || 
+									element.getAttribute('role') === 'listbox' ||
+									element.getAttribute('role') === 'combobox') {
+									// Find all menu items
+									const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+									const options = [];
+									
+									menuItems.forEach((item, idx) => {
+										// Get the text content of the menu item
+										const text = item.textContent.trim();
+										if (text) {
+											options.push({
+												text: text,
+												value: text, // For ARIA menus, use text as value
+												index: idx
+											});
+										}
+									});
+									
+									return {
+										type: 'aria',
+										options: options,
+										id: element.id || '',
+										name: element.getAttribute('aria-label') || ''
+									};
+								}
+								
+								return null;
 							}
 						""",
 							dom_element.xpath,
 						)
 
 						if options:
-							logger.debug(f'Found dropdown in frame {frame_index}')
-							logger.debug(f'Dropdown ID: {options["id"]}, Name: {options["name"]}')
+							logger.debug(f'Found {options["type"]} dropdown in frame {frame_index}')
+							logger.debug(f'Element ID: {options["id"]}, Name: {options["name"]}')
 
 							formatted_options = []
 							for opt in options['options']:
@@ -817,24 +849,18 @@ Explain the content of the page and that the requested information is not availa
 				return ActionResult(extracted_content=msg, include_in_memory=True)
 
 		@self.registry.action(
-			description='Select dropdown option for interactive element index by the text of the option you want to select',
+			description='Select dropdown option or ARIA menu item for interactive element index by the text of the option you want to select',
 		)
 		async def select_dropdown_option(
 			index: int,
 			text: str,
 			browser_session: BrowserSession,
 		) -> ActionResult:
-			"""Select dropdown option by the text of the option you want to select"""
+			"""Select dropdown option or ARIA menu item by the text of the option you want to select"""
 			page = await browser_session.get_current_page()
 			dom_element = await browser_session.get_dom_element_by_index(index)
 			if dom_element is None:
 				raise Exception(f'Element index {index} does not exist - retry or use alternative actions')
-
-			# Validate that we're working with a select element
-			if dom_element.tag_name != 'select':
-				logger.error(f'Element is not a select! Tag: {dom_element.tag_name}, Attributes: {dom_element.attributes}')
-				msg = f'Cannot select option: Element with index {index} is a {dom_element.tag_name}, not a select'
-				return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg)
 
 			logger.debug(f"Attempting to select '{text}' using xpath: {dom_element.xpath}")
 			logger.debug(f'Element attributes: {dom_element.attributes}')
@@ -848,27 +874,48 @@ Explain the content of the page and that the requested information is not availa
 					try:
 						logger.debug(f'Trying frame {frame_index} URL: {frame.url}')
 
-						# First verify we can find the dropdown in this frame
-						find_dropdown_js = """
+						# First check what type of element we're dealing with
+						element_info_js = """
 							(xpath) => {
 								try {
-									const select = document.evaluate(xpath, document, null,
+									const element = document.evaluate(xpath, document, null,
 										XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-									if (!select) return null;
-									if (select.tagName.toLowerCase() !== 'select') {
+									if (!element) return null;
+									
+									const tagName = element.tagName.toLowerCase();
+									const role = element.getAttribute('role');
+									
+									// Check if it's a native select
+									if (tagName === 'select') {
 										return {
-											error: `Found element but it's a ${select.tagName}, not a SELECT`,
-											found: false
+											type: 'select',
+											found: true,
+											id: element.id,
+											name: element.name,
+											tagName: element.tagName,
+											optionCount: element.options.length,
+											currentValue: element.value,
+											availableOptions: Array.from(element.options).map(o => o.text.trim())
 										};
 									}
+									
+									// Check if it's an ARIA menu or similar
+									if (role === 'menu' || role === 'listbox' || role === 'combobox') {
+										const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+										return {
+											type: 'aria',
+											found: true,
+											id: element.id || '',
+											role: role,
+											tagName: element.tagName,
+											itemCount: menuItems.length,
+											availableOptions: Array.from(menuItems).map(item => item.textContent.trim())
+										};
+									}
+									
 									return {
-										id: select.id,
-										name: select.name,
-										found: true,
-										tagName: select.tagName,
-										optionCount: select.options.length,
-										currentValue: select.value,
-										availableOptions: Array.from(select.options).map(o => o.text.trim())
+										error: `Element is neither a select nor an ARIA menu (tag: ${tagName}, role: ${role})`,
+										found: false
 									};
 								} catch (e) {
 									return {error: e.toString(), found: false};
@@ -876,28 +923,90 @@ Explain the content of the page and that the requested information is not availa
 							}
 						"""
 
-						dropdown_info = await frame.evaluate(find_dropdown_js, dom_element.xpath)
+						element_info = await frame.evaluate(element_info_js, dom_element.xpath)
 
-						if dropdown_info:
-							if not dropdown_info.get('found'):
-								logger.error(f'Frame {frame_index} error: {dropdown_info.get("error")}')
-								continue
+						if element_info and element_info.get('found'):
+							logger.debug(f'Found {element_info.get("type")} element in frame {frame_index}: {element_info}')
 
-							logger.debug(f'Found dropdown in frame {frame_index}: {dropdown_info}')
+							if element_info.get('type') == 'select':
+								# Handle native select element
+								# "label" because we are selecting by text
+								# nth(0) to disable error thrown by strict mode
+								# timeout=1000 because we are already waiting for all network events
+								selected_option_values = (
+									await frame.locator('//' + dom_element.xpath).nth(0).select_option(label=text, timeout=1000)
+								)
 
-							# "label" because we are selecting by text
-							# nth(0) to disable error thrown by strict mode
-							# timeout=1000 because we are already waiting for all network events, therefore ideally we don't need to wait a lot here (default 30s)
-							selected_option_values = (
-								await frame.locator('//' + dom_element.xpath).nth(0).select_option(label=text, timeout=1000)
-							)
+								msg = f'selected option {text} with value {selected_option_values}'
+								logger.info(msg + f' in frame {frame_index}')
 
-							msg = f'selected option {text} with value {selected_option_values}'
-							logger.info(msg + f' in frame {frame_index}')
+								return ActionResult(
+									extracted_content=msg, include_in_memory=True, long_term_memory=f"Selected option '{text}'"
+								)
 
-							return ActionResult(
-								extracted_content=msg, include_in_memory=True, long_term_memory=f"Selected option '{text}'"
-							)
+							elif element_info.get('type') == 'aria':
+								# Handle ARIA menu
+								click_aria_item_js = """
+									(params) => {
+										const { xpath, targetText } = params;
+										try {
+											const element = document.evaluate(xpath, document, null,
+												XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+											if (!element) return {success: false, error: 'Element not found'};
+											
+											// Find all menu items
+											const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+											
+											for (const item of menuItems) {
+												const itemText = item.textContent.trim();
+												if (itemText === targetText) {
+													// Simulate click on the menu item
+													item.click();
+													
+													// Also try dispatching a click event in case the click handler needs it
+													const clickEvent = new MouseEvent('click', {
+														view: window,
+														bubbles: true,
+														cancelable: true
+													});
+													item.dispatchEvent(clickEvent);
+													
+													return {
+														success: true,
+														message: `Clicked menu item: ${targetText}`
+													};
+												}
+											}
+											
+											return {
+												success: false,
+												error: `Menu item with text '${targetText}' not found`
+											};
+										} catch (e) {
+											return {success: false, error: e.toString()};
+										}
+									}
+								"""
+
+								result = await frame.evaluate(
+									click_aria_item_js, {'xpath': dom_element.xpath, 'targetText': text}
+								)
+
+								if result.get('success'):
+									msg = result.get('message', f'Selected ARIA menu item: {text}')
+									logger.info(msg + f' in frame {frame_index}')
+									return ActionResult(
+										extracted_content=msg,
+										include_in_memory=True,
+										long_term_memory=f"Selected menu item '{text}'",
+									)
+								else:
+									logger.error(f'Failed to select ARIA menu item: {result.get("error")}')
+									continue
+
+						elif element_info:
+							logger.error(f'Frame {frame_index} error: {element_info.get("error")}')
+							continue
 
 					except Exception as frame_e:
 						logger.error(f'Frame {frame_index} attempt failed: {str(frame_e)}')
